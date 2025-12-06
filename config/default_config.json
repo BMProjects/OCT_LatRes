@@ -1,0 +1,17 @@
+{
+  "physical": {
+    "pixel_scale_um_per_px": 3.012,
+    "ball_diameter_um": 1.0,
+    "roi_radius_factor": 1.5,
+    "vertical_window_factor": 3.0,
+    "min_dist_factor": 1.5
+  },
+  "analysis": {
+    "min_valid_balls": 50
+  },
+  "detection": {
+    "min_diameter_um": 9.0,
+    "max_diameter_um": 18.0,
+    "background_threshold": 6000.0
+  }
+}
