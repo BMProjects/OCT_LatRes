@@ -4,9 +4,15 @@
 - 将检测、profile、FWHM 各自封装成独立模块，保持依赖透明；
 - `run_analysis` 提供 v1 正式算法（DoG + 离散 FWHM）；
 - `_compute_statistics` 提供统一统计逻辑，方便 GUI / 报告层共用。
+
+改进 v1.1:
+- SNR自适应峰值阈值，替换固定0.5
+- 单峰性检测，过滤多峰噪声
+- 0-1置信度评分系统
 """
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import replace
 from typing import Callable, List, Sequence, Tuple
@@ -14,6 +20,7 @@ from typing import Callable, List, Sequence, Tuple
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 from skimage.transform import resize
 
 from .detection import detect_balls
@@ -21,6 +28,8 @@ from .fwhm import fwhm_discrete
 from .image_ops import to_gray16
 from .models import AnalysisConfig, AnalysisResult, BallMeasurement
 from .profile import extract_profile
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_statistics(values: Sequence[float]) -> tuple[float, float, float, float]:
@@ -51,7 +60,9 @@ def run_analysis(
     measurements = detect_balls(gray_image, config)
     if not measurements:
         return AnalysisResult(
-            warnings=["No candidate balls detected"], algorithm_version="v1 (DoG + discrete FWHM)"
+            warnings=["No candidate balls detected"],
+            algorithm_version="v1 (DoG + discrete FWHM)",
+            upsample_factor=upsample_factor,
         )
 
     pixel_size_um = config.pixel_size_um()
@@ -60,16 +71,16 @@ def run_analysis(
     failure_counts: Counter[str] = Counter()
 
     candidates, rejected_radius, r_med = _filter_by_radius(measurements)
-    print(
-        f"[analysis] after radius filter: {len(candidates)} kept / {len(measurements)} total | median={r_med:.2f}px"
+    logger.info(
+        f"after radius filter: {len(candidates)} kept / {len(measurements)} total | median={r_med:.2f}px"
     )
     invalid.extend(rejected_radius)
     if progress_cb:
         progress_cb(f"半径筛选 {len(candidates)}/{len(measurements)}")
 
     candidates, rejected_peak, peak_stats = _filter_by_peak_intensity(gray_image, candidates, config)
-    print(
-        f"[analysis] after peak filter: {len(candidates)} kept | "
+    logger.info(
+        f"after peak filter: {len(candidates)} kept | "
         f"peak stats min/median/max={peak_stats[0]:.3f}/{peak_stats[1]:.3f}/{peak_stats[2]:.3f}"
     )
     invalid.extend(rejected_peak)
@@ -77,8 +88,8 @@ def run_analysis(
         progress_cb(f"峰值筛选 {len(candidates)}")
 
     candidates, rejected_fit, fit_stats = _filter_by_gaussian_fit(gray_image, candidates, config)
-    print(
-        "[analysis] after 2D gaussian fit filter: "
+    logger.info(
+        f"after 2D gaussian fit filter: "
         f"{len(candidates)} kept | median axis_ratio={fit_stats['axis_ratio_med']:.2f} "
         f"median sigma={fit_stats['sigma_med']:.2f}px median residual={fit_stats['residual_med']:.3f} "
         f"median fwhm={fit_stats['fwhm_med']:.2f}px"
@@ -109,6 +120,13 @@ def run_analysis(
             invalid.append(measurement)
             continue
 
+        # 单峰性检测
+        if not _is_single_peak(profile):
+            measurement.quality_flag = "multi_peak"
+            failure_counts[measurement.quality_flag] += 1
+            invalid.append(measurement)
+            continue
+
         width_px = fwhm_discrete(profile)
         if width_px <= 0:
             measurement.quality_flag = "invalid_width"
@@ -118,13 +136,17 @@ def run_analysis(
         measurement.xfwhm_px = width_px
         measurement.resolution_um = width_px * pixel_size_um
         measurement.fwhm_residual = float(np.mean(np.abs(profile - gaussian_filter1d(profile, sigma=1.5))))
+        
+        # 计算置信度评分 0-1
+        measurement.confidence_score = _compute_confidence_score(measurement)
+        
         measurement.valid = True
         measurement.quality_flag = "ok"
         valid.append(measurement)
         passed_profile += 1
-    print(f"[analysis] after profile/FWHM: {passed_profile} kept")
+    logger.info(f"after profile/FWHM: {passed_profile} kept")
     if failure_counts:
-        print(f"[analysis] profile/FWHM failure stats: {dict(failure_counts)}")
+        logger.info(f"profile/FWHM failure stats: {dict(failure_counts)}")
     if progress_cb:
         progress_cb(f"Profile/FWHM 完成 {len(valid)}")
 
@@ -133,6 +155,7 @@ def run_analysis(
         invalid_balls=invalid,
         n_valid=len(valid),
         algorithm_version="v1 (DoG + discrete FWHM)",
+        upsample_factor=upsample_factor,
     )
     result.n_valid = len(valid)
     if valid:
@@ -195,7 +218,7 @@ def _filter_by_radius(
 
     lower = max(abs_min, 0.7 * r_med)
     upper = 2.0 * r_med
-    print(f"[analysis] radius median(after abs)={r_med:.2f}px -> range=({lower:.2f},{upper:.2f})")
+    logger.info(f"radius median(after abs)={r_med:.2f}px -> range=({lower:.2f},{upper:.2f})")
 
     kept: List[BallMeasurement] = []
     for m, r in primary:
@@ -213,33 +236,42 @@ def _filter_by_peak_intensity(
     gray_image: np.ndarray,
     measurements: List[BallMeasurement],
     config: AnalysisConfig,
+    snr_factor: float = 4.0,
 ) -> Tuple[List[BallMeasurement], List[BallMeasurement], Tuple[float, float, float]]:
+    """SNR自适应峰值过滤，替换固定阈值0.5。
+
+    使用 peak_snr = (peak - bg_mean) / bg_std 作为判决依据，
+    默认 snr_factor=4.0 意味着峰值需高于背景 4 个标准差。
+    """
     kept: List[BallMeasurement] = []
     rejected: List[BallMeasurement] = []
     if not measurements:
         return kept, rejected, (0.0, 0.0, 0.0)
 
     peaks = []
-    bg_means = []
+    snrs = []
     for m in measurements:
-        peak, bg_mean = _compute_peak_intensity(gray_image, m, config)
+        peak, bg_mean, bg_std = _compute_peak_intensity_with_snr(gray_image, m, config)
         m.peak_intensity = peak
+        # 计算SNR: (peak - background) / noise
+        snr = (peak - bg_mean) / max(bg_std, 1e-6)
+        m.peak_snr = snr
         peaks.append(peak)
-        bg_means.append(bg_mean)
+        snrs.append(snr)
 
     peak_arr = np.array(peaks, dtype=np.float32)
-    hist_counts, hist_bins = np.histogram(peak_arr, bins=10, range=(0.0, 1.0))
+    snr_arr = np.array(snrs, dtype=np.float32)
+    hist_counts, hist_bins = np.histogram(snr_arr, bins=10)
     hist_desc = ", ".join(
-        f"{hist_bins[i]:.2f}-{hist_bins[i+1]:.2f}:{hist_counts[i]}" for i in range(len(hist_counts))
+        f"{hist_bins[i]:.1f}-{hist_bins[i+1]:.1f}:{hist_counts[i]}" for i in range(len(hist_counts))
     )
-    print(f"[analysis] peak histogram: {hist_desc}")
+    logger.info(f"peak SNR histogram: {hist_desc}")
 
-    threshold = 0.5
-    for m, peak in zip(measurements, peaks):
-        if peak >= threshold:
+    for m, snr in zip(measurements, snrs):
+        if snr >= snr_factor:
             kept.append(m)
         else:
-            m.quality_flag = "low_peak"
+            m.quality_flag = "low_peak_snr"
             rejected.append(m)
 
     peak_stats = (
@@ -250,11 +282,12 @@ def _filter_by_peak_intensity(
     return kept, rejected, peak_stats
 
 
-def _compute_peak_intensity(
+def _compute_peak_intensity_with_snr(
     gray_image: np.ndarray,
     measurement: BallMeasurement,
     config: AnalysisConfig,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
+    """计算峰值强度、背景均值和背景标准差，用于SNR自适应过滤。"""
     psf_r = measurement.psf_radius_px if measurement.psf_radius_px else max(
         config.physical.ball_radius_um() / max(config.pixel_size_um(), 1e-6), 1.0
     )
@@ -268,13 +301,14 @@ def _compute_peak_intensity(
     z1 = min(cz + half_h, gray_image.shape[0])
     patch = gray_image[z0:z1, x0:x1].astype(np.float32) / 65535.0
     if patch.size == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 1.0
     peak = float(np.max(patch))
     flattened = np.sort(patch.reshape(-1))
     bg_count = max(int(len(flattened) * 0.2), 1)
     bg_vals = flattened[:bg_count]
     bg_mean = float(np.mean(bg_vals))
-    return peak, bg_mean
+    bg_std = float(np.std(bg_vals)) if bg_count > 1 else 0.01
+    return peak, bg_mean, bg_std
 
 
 def _gaussian2d(coords, amp, x0, y0, sigma_x, sigma_y, bg):
@@ -424,3 +458,82 @@ def _prepare_profile(profile: np.ndarray) -> np.ndarray:
     if max_val <= 0:
         return smoothed
     return smoothed / max_val
+
+
+def _is_single_peak(profile: np.ndarray, prominence_ratio: float = 0.3) -> bool:
+    """检测profile是否为单峰形态。
+
+    使用scipy.signal.find_peaks检测主峰和次峰，
+    如果次峰的prominence超过主峰的prominence_ratio倍，则判定为多峰。
+
+    Args:
+        profile: 归一化后的强度曲线
+        prominence_ratio: 次峰相对主峰的最大允许比例，默认0.3
+
+    Returns:
+        True表示单峰，False表示多峰
+    """
+    if profile.size < 5:
+        return True  # 太短无法判断
+
+    # 寻找所有峰，设置最小prominence
+    peaks, properties = find_peaks(profile, prominence=0.05)
+    if len(peaks) == 0:
+        return False  # 无峰
+    if len(peaks) == 1:
+        return True  # 单峰
+
+    # 按prominence排序
+    prominences = properties["prominences"]
+    sorted_idx = np.argsort(prominences)[::-1]
+    main_prominence = prominences[sorted_idx[0]]
+    secondary_prominence = prominences[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
+
+    # 如果次峰的prominence超过主峰的一定比例，则为多峰
+    return secondary_prominence < prominence_ratio * main_prominence
+
+
+def _compute_confidence_score(measurement: BallMeasurement) -> float:
+    """计算综合置信度评分 0-1。
+
+    综合考虑以下因素:
+    - peak_snr: SNR越高，置信度越高
+    - fit_residual: 残差越小，置信度越高
+    - fit_axis_ratio: 轴比越接近1-2，置信度越高
+    - fwhm_residual: FWHM残差越小，置信度越高
+
+    Returns:
+        0-1之间的置信度分数
+    """
+    scores = []
+
+    # SNR评分: 4-20映射到0.5-1.0
+    if measurement.peak_snr is not None:
+        snr_score = np.clip((measurement.peak_snr - 4.0) / 16.0, 0.0, 1.0) * 0.5 + 0.5
+        scores.append(snr_score)
+
+    # 拟合残差评分: 0.0-0.25映射到1.0-0.5
+    if measurement.fit_residual is not None:
+        residual_score = np.clip(1.0 - measurement.fit_residual / 0.25, 0.5, 1.0)
+        scores.append(residual_score)
+
+    # 轴比评分: 1.0-2.0最优，超出范围递减
+    if measurement.fit_axis_ratio is not None:
+        ratio = measurement.fit_axis_ratio
+        if 1.0 <= ratio <= 2.0:
+            axis_score = 1.0
+        elif ratio < 1.0:
+            axis_score = max(0.5, ratio)
+        else:  # ratio > 2.0
+            axis_score = max(0.5, 1.0 - (ratio - 2.0) / 2.0)
+        scores.append(axis_score)
+
+    # FWHM残差评分: 0-0.15映射到1.0-0.5
+    if measurement.fwhm_residual is not None:
+        fwhm_score = np.clip(1.0 - measurement.fwhm_residual / 0.15, 0.5, 1.0)
+        scores.append(fwhm_score)
+
+    if not scores:
+        return 0.5  # 默认中等置信度
+
+    return float(np.mean(scores))

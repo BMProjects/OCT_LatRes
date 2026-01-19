@@ -77,8 +77,9 @@ class BallMeasurement:
     diameter_px: float
     sigma_px: Optional[float] = None
     psf_radius_px: Optional[float] = None
-    psf_radius_px: Optional[float] = None
     peak_intensity: Optional[float] = None
+    peak_snr: Optional[float] = None  # SNR自适应峰值检测的信噪比
+    confidence_score: Optional[float] = None  # 综合置信度评分 0-1
     profile_curve: Optional[np.ndarray] = None
     fwhm_residual: Optional[float] = None
     fit_amplitude: Optional[float] = None
@@ -107,6 +108,8 @@ class AnalysisResult:
     n_valid: int = 0
     algorithm_version: str = "v0"
     warnings: List[str] = field(default_factory=list)
+    upsample_factor: int = 1  # 图像上采样因子，用于前端坐标缩放
+
 
     def summary_dict(self) -> dict:
         """以 dict 形式导出主要指标，便于日志或 CSV 序列化。"""
