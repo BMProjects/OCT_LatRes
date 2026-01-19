@@ -86,6 +86,29 @@ def run_analysis(
     invalid.extend(rejected_peak)
     if progress_cb:
         progress_cb(f"峰值筛选 {len(candidates)}")
+    
+    # 新增：边界剔除
+    candidates, rejected_boundary = _filter_by_boundary(gray_image, candidates)
+    logger.info(f"after boundary filter: {len(candidates)} kept")
+    invalid.extend(rejected_boundary)
+    if progress_cb:
+        progress_cb(f"边界筛选 {len(candidates)}")
+    
+    # 新增：相对亮度筛选
+    candidates, rejected_rel_intensity = _filter_by_relative_intensity(candidates, percentile=90.0, threshold_ratio=0.4)
+    logger.info(f"after relative intensity filter: {len(candidates)} kept")
+    invalid.extend(rejected_rel_intensity)
+    if progress_cb:
+        progress_cb(f"相对亮度筛选 {len(candidates)}")
+    
+    # 统计筛选结果
+    filter_stats = {
+        "total_detected": len(measurements),
+        "radius_rejected": len(rejected_radius),
+        "snr_rejected": len(rejected_peak),
+        "boundary_rejected": len(rejected_boundary),
+        "dim_target_rejected": len(rejected_rel_intensity),
+    }
 
     candidates, rejected_fit, fit_stats = _filter_by_gaussian_fit(gray_image, candidates, config)
     logger.info(
@@ -94,6 +117,8 @@ def run_analysis(
         f"median sigma={fit_stats['sigma_med']:.2f}px median residual={fit_stats['residual_med']:.3f} "
         f"median fwhm={fit_stats['fwhm_med']:.2f}px"
     )
+    fit_rejected_count = len(rejected_fit)
+    filter_stats["fit_rejected"] = fit_rejected_count
     invalid.extend(rejected_fit)
     if progress_cb:
         progress_cb(f"2D 拟合筛选 {len(candidates)}")
@@ -137,6 +162,17 @@ def run_analysis(
         measurement.resolution_um = width_px * pixel_size_um
         measurement.fwhm_residual = float(np.mean(np.abs(profile - gaussian_filter1d(profile, sigma=1.5))))
         
+        # 计算锐度指标
+        sharpness = _compute_profile_sharpness(profile)
+        measurement.sharpness = sharpness
+        
+        # 锐度过滤：拒绝模糊目标
+        if sharpness < 0.1:  # 可调参数
+            measurement.quality_flag = "low_sharpness"
+            failure_counts[measurement.quality_flag] += 1
+            invalid.append(measurement)
+            continue
+        
         # 计算置信度评分 0-1
         measurement.confidence_score = _compute_confidence_score(measurement)
         
@@ -147,6 +183,10 @@ def run_analysis(
     logger.info(f"after profile/FWHM: {passed_profile} kept")
     if failure_counts:
         logger.info(f"profile/FWHM failure stats: {dict(failure_counts)}")
+        # Merge detailed failure counts into filter_stats for display
+        for reason, count in failure_counts.items():
+            filter_stats[f"profile_{reason}"] = count
+    
     if progress_cb:
         progress_cb(f"Profile/FWHM 完成 {len(valid)}")
 
@@ -155,6 +195,7 @@ def run_analysis(
         invalid_balls=invalid,
         n_valid=len(valid),
         algorithm_version="v1 (DoG + discrete FWHM)",
+        filter_stats=filter_stats,
         upsample_factor=upsample_factor,
     )
     result.n_valid = len(valid)
@@ -236,12 +277,12 @@ def _filter_by_peak_intensity(
     gray_image: np.ndarray,
     measurements: List[BallMeasurement],
     config: AnalysisConfig,
-    snr_factor: float = 4.0,
+    snr_factor: float = 6.0,  # 从4.0提高到6.0，更严格过滤散斑
 ) -> Tuple[List[BallMeasurement], List[BallMeasurement], Tuple[float, float, float]]:
     """SNR自适应峰值过滤，替换固定阈值0.5。
 
     使用 peak_snr = (peak - bg_mean) / bg_std 作为判决依据，
-    默认 snr_factor=4.0 意味着峰值需高于背景 4 个标准差。
+    默认 snr_factor=6.0 意味着峰值需高于背景 6 个标准差。
     """
     kept: List[BallMeasurement] = []
     rejected: List[BallMeasurement] = []
@@ -280,6 +321,102 @@ def _filter_by_peak_intensity(
         float(peak_arr.max()) if peak_arr.size else 0.0,
     )
     return kept, rejected, peak_stats
+
+
+def _filter_by_relative_intensity(
+    measurements: List[BallMeasurement],
+    percentile: float = 90.0,
+    threshold_ratio: float = 0.4,
+) -> Tuple[List[BallMeasurement], List[BallMeasurement]]:
+    """相对亮度筛选：基于最亮目标的百分比过滤。
+    
+    原理：真实完美靶球通常是全图最亮的物体。散斑和旁瓣相对较暗。
+    
+    Args:
+        measurements: 候选测量列表
+        percentile: 用于确定参考亮度的百分位数（90表示最亮的10%）
+        threshold_ratio: 相对于参考亮度的阈值比例（0.4表示至少达到40%）
+    
+    Returns:
+        (kept, rejected): 保留和拒绝的测量列表
+    """
+    kept: List[BallMeasurement] = []
+    rejected: List[BallMeasurement] = []
+    
+    if not measurements:
+        return kept, rejected
+    
+    # 收集所有峰值亮度
+    intensities = np.array([m.peak_intensity for m in measurements if m.peak_intensity is not None])
+    
+    if intensities.size == 0:
+        # 如果没有亮度信息，全部保留（向后兼容）
+        return list(measurements), []
+    
+    # 计算参考亮度：最亮物体的百分位数
+    ref_intensity = float(np.percentile(intensities, percentile))
+    threshold = ref_intensity * threshold_ratio
+    
+    logger.info(
+        f"relative intensity filter: ref(p{percentile})={ref_intensity:.3f}, "
+        f"threshold={threshold:.3f} ({threshold_ratio*100:.0f}%)"
+    )
+    
+    for m in measurements:
+        if m.peak_intensity is not None and m.peak_intensity >= threshold:
+            kept.append(m)
+        else:
+            m.quality_flag = "dim_target"
+            rejected.append(m)
+    
+    return kept, rejected
+
+
+def _filter_by_boundary(
+    gray_image: np.ndarray,
+    measurements: List[BallMeasurement],
+    margin_factor: float = 2.0,
+) -> Tuple[List[BallMeasurement], List[BallMeasurement]]:
+    """边界筛选：剔除距离图像边缘过近的目标。
+    
+    边界球的Profile提取和拟合不可靠，应直接剔除。
+    
+    Args:
+        gray_image: 原始图像
+        measurements: 候选测量列表
+        margin_factor: 边界留白倍数（相对于球半径）
+    
+    Returns:
+        (kept, rejected): 保留和拒绝的测量列表
+    """
+    kept: List[BallMeasurement] = []
+    rejected: List[BallMeasurement] = []
+    
+    if not measurements:
+        return kept, rejected
+    
+    height, width = gray_image.shape
+    
+    for m in measurements:
+        radius = m.diameter_px / 2.0 if m.diameter_px else 5.0
+        margin = radius * margin_factor
+        
+        x, z = m.x_px, m.z_px
+        
+        # 检查是否过近边界
+        if (x < margin or x > width - margin or 
+            z < margin or z > height - margin):
+            m.quality_flag = "near_boundary"
+            rejected.append(m)
+        else:
+            kept.append(m)
+    
+    logger.info(
+        f"boundary filter: margin={margin_factor}x radius, "
+        f"rejected {len(rejected)} near-boundary targets"
+    )
+    
+    return kept, rejected
 
 
 def _compute_peak_intensity_with_snr(
@@ -460,15 +597,45 @@ def _prepare_profile(profile: np.ndarray) -> np.ndarray:
     return smoothed / max_val
 
 
-def _is_single_peak(profile: np.ndarray, prominence_ratio: float = 0.3) -> bool:
+def _compute_profile_sharpness(profile: np.ndarray) -> float:
+    """计算Profile曲线的锐度指标。
+    
+    锐度通过最大梯度值来衡量。清晰的靶球边缘会有陡峭的梯度。
+    模糊的散斑或旁瓣扫描梯度较缓。
+    
+    Args:
+        profile: 归一化后的Profile曲线 (范围0-1)
+    
+    Returns:
+        锐度值 (约0-1范围，值越大越锐利)
+    """
+    if profile.size < 3:
+        return 0.0
+    
+    # 计算一阶导数（梯度）
+    gradient = np.gradient(profile)
+    
+    # 使用最大梯度幅值作为锐度指标
+    max_gradient = float(np.max(np.abs(gradient)))
+    
+    # 另一种方法：计算峰值/FWHM比率（高窄峰=锐利）
+    # 这里我们使用梯度方法
+    
+    return max_gradient
+
+
+def _is_single_peak(profile: np.ndarray, prominence_ratio: float = 0.3, use_curvature_check: bool = True) -> bool:
     """检测profile是否为单峰形态。
 
     使用scipy.signal.find_peaks检测主峰和次峰，
     如果次峰的prominence超过主峰的prominence_ratio倍，则判定为多峰。
+    
+    增强版：额外检查二阶导数，识别未完全分离的重叠峰。
 
     Args:
         profile: 归一化后的强度曲线
         prominence_ratio: 次峰相对主峰的最大允许比例，默认0.3
+        use_curvature_check: 是否启用二阶导数（曲率）检查
 
     Returns:
         True表示单峰，False表示多峰
@@ -476,21 +643,54 @@ def _is_single_peak(profile: np.ndarray, prominence_ratio: float = 0.3) -> bool:
     if profile.size < 5:
         return True  # 太短无法判断
 
-    # 寻找所有峰，设置最小prominence
+    # 第一步：常规prominence检查
     peaks, properties = find_peaks(profile, prominence=0.05)
     if len(peaks) == 0:
         return False  # 无峰
     if len(peaks) == 1:
-        return True  # 单峰
+        pass  # 单峰，继续检查曲率
+    else:
+        # 按prominence排序
+        prominences = properties["prominences"]
+        sorted_idx = np.argsort(prominences)[::-1]
+        main_prominence = prominences[sorted_idx[0]]
+        secondary_prominence = prominences[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
 
-    # 按prominence排序
-    prominences = properties["prominences"]
-    sorted_idx = np.argsort(prominences)[::-1]
-    main_prominence = prominences[sorted_idx[0]]
-    secondary_prominence = prominences[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
-
-    # 如果次峰的prominence超过主峰的一定比例，则为多峰
-    return secondary_prominence < prominence_ratio * main_prominence
+        # 如果次峰的prominence超过主峰的一定比例，则为多峰
+        if secondary_prominence >= prominence_ratio * main_prominence:
+            return False
+    
+    # 第二步（增强）：二阶导数检查，识别“肩部”重叠
+    if use_curvature_check and profile.size >= 7:
+        # 平滑profile减少噪声影响
+        smoothed = gaussian_filter1d(profile, sigma=1.0)
+        
+        # 计算二阶导数（曲率）
+        second_derivative = np.gradient(np.gradient(smoothed))
+        
+        # 找到负曲率区域（凸峰区域）
+        negative_curvature = second_derivative < -0.01  # 阈值可调
+        
+        # 连续区域标记
+        from scipy.ndimage import label
+        labeled, num_regions = label(negative_curvature)
+        
+        # 如果有多个分离的负曲率区域，可能是重叠峰
+        if num_regions > 1:
+            # 计算每个区域的“强度”
+            region_strengths = []
+            for i in range(1, num_regions + 1):
+                region_mask = (labeled == i)
+                strength = float(np.sum(np.abs(second_derivative[region_mask])))
+                region_strengths.append(strength)
+            
+            # 如果有多个显著的区域，判定为多峰
+            sorted_strengths = sorted(region_strengths, reverse=True)
+            if len(sorted_strengths) >= 2:
+                if sorted_strengths[1] > 0.3 * sorted_strengths[0]:  # 次峰区域超过30%
+                    return False
+    
+    return True
 
 
 def _compute_confidence_score(measurement: BallMeasurement) -> float:

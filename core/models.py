@@ -80,6 +80,7 @@ class BallMeasurement:
     peak_intensity: Optional[float] = None
     peak_snr: Optional[float] = None  # SNR自适应峰值检测的信噪比
     confidence_score: Optional[float] = None  # 综合置信度评分 0-1
+    sharpness: Optional[float] = None  # Profile锐度指标 (梯度)
     profile_curve: Optional[np.ndarray] = None
     fwhm_residual: Optional[float] = None
     fit_amplitude: Optional[float] = None
@@ -108,6 +109,7 @@ class AnalysisResult:
     n_valid: int = 0
     algorithm_version: str = "v0"
     warnings: List[str] = field(default_factory=list)
+    filter_stats: Dict[str, int] = field(default_factory=dict)  # 各筛选步骤的拒绝数量统计
     upsample_factor: int = 1  # 图像上采样因子，用于前端坐标缩放
 
 

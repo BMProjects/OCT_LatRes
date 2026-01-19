@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QThread, QPoint, QRect
+from PySide6.QtCore import Qt, Signal, QThread, QPoint, QRect, QPointF, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QBrush
 from PySide6.QtWidgets import (
     QApplication,
@@ -79,152 +79,248 @@ QLabel#ROIInfo { font-family: Consolas, monospace; font-size: 11px; color: #f59e
 
 
 class ImageCanvas(QWidget):
-    """Centered image preview with ROI selection and overlay support."""
+    """Centered image preview with ROI selection, overlay, and zoom/pan support."""
 
     roi_changed = Signal(object)  # Emits (x, y, w, h) tuple or None
 
     def __init__(self) -> None:
         super().__init__()
-        self.setAutoFillBackground(True)
-        self.setStyleSheet("background-color: #050505;")
-        self.setMouseTracking(False)  # Initially disabled
-        self.setCursor(Qt.ArrowCursor)
+        self.setMouseTracking(True)
+        self.setBackgroundRole(QPalette.Dark)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
-        self._raw_pixmap: Optional[QPixmap] = None
-        self._scaled_pixmap: Optional[QPixmap] = None
-        self._orig_shape: Optional[tuple[int, int]] = None  # (h, w)
+        # Data
+        self._raw_image: Optional[QImage] = None
         self._last_result: Optional[AnalysisResult] = None
-        self._selected_ball_index: Optional[int] = None  # For highlighting
+        self._selected_ball_index: Optional[int] = None
+        self._buffer: Optional[np.ndarray] = None
         
-        # ROI state
-        self._roi_enabled: bool = False  # ROI selection mode
-        self._roi_rect: Optional[QRect] = None  # In original image coordinates
-        self._is_drawing: bool = False
-        self._draw_start: Optional[QPoint] = None
-        self._temp_rect: Optional[QRect] = None  # Current drawing rect (display coords)
+        # View state
+        self._zoom: float = 1.0
+        self._pan: QPointF = QPointF(0, 0)
+        self._fit_scale: float = 1.0
+        self._draw_offset: QPointF = QPointF(0, 0)
         
-        self._label = QLabel("加载一张 OCT 图像以开始")
-        self._label.setAlignment(Qt.AlignCenter)
-        self._label.setStyleSheet("color: #555; font-size: 14px;")
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._label)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._update_scaled_pixmap()
+        # Interaction
+        self._is_panning: bool = False
+        self._last_mouse_pos: QPointF = QPointF()
+        
+        # ROI
+        self._roi_enabled: bool = False
+        self._is_drawing_roi: bool = False
+        self._roi_rect: Optional[QRect] = None
+        self._temp_roi_rect: Optional[QRect] = None
+        self._roi_start: QPointF = QPointF()
+        
+        self.setCursor(Qt.ArrowCursor)
 
     def set_image(self, image: np.ndarray) -> None:
-        self._orig_shape = image.shape[:2]
+        self._raw_image = self._to_qimage(image)
         self._last_result = None
         self._roi_rect = None
-        self._temp_rect = None
-        qimage = self._to_qimage(image)
-        self._raw_pixmap = QPixmap.fromImage(qimage)
-        self._update_scaled_pixmap()
+        self._temp_roi_rect = None
+        self._selected_ball_index = None
+        self._zoom = 1.0
+        self._pan = QPointF(0, 0)
+        self.update()
         self.roi_changed.emit(None)
 
     def clear_roi(self) -> None:
-        """Clear the current ROI selection."""
         self._roi_rect = None
-        self._temp_rect = None
-        self._redraw_overlay()
+        self._temp_roi_rect = None
+        self.update()
         self.roi_changed.emit(None)
 
     def clear_results(self) -> None:
-        """Clear analysis results overlay."""
         self._last_result = None
-        self._redraw_overlay()
+        self.update()
 
     def get_roi(self) -> Optional[tuple]:
-        """Get current ROI as (x, y, w, h) in original image coordinates."""
         if self._roi_rect:
-            return (self._roi_rect.x(), self._roi_rect.y(), 
-                    self._roi_rect.width(), self._roi_rect.height())
+            x, y, w, h = self._roi_rect.getRect()
+            return (int(x), int(y), int(w), int(h))
         return None
 
-    def _get_image_rect(self) -> QRect:
-        """Get the rectangle where the image is displayed."""
-        if not self._scaled_pixmap:
-            return QRect()
-        pw, ph = self._scaled_pixmap.width(), self._scaled_pixmap.height()
-        x = (self.width() - pw) // 2
-        y = (self.height() - ph) // 2
-        return QRect(x, y, pw, ph)
-
-    def _display_to_image(self, pos: QPoint) -> Optional[QPoint]:
-        """Convert display coordinates to original image coordinates."""
-        if not self._orig_shape or not self._scaled_pixmap:
-            return None
-        img_rect = self._get_image_rect()
-        if not img_rect.contains(pos):
-            return None
-        # Relative position within scaled image
-        rx = pos.x() - img_rect.x()
-        ry = pos.y() - img_rect.y()
-        # Scale to original image
-        h, w = self._orig_shape
-        ox = int(rx * w / img_rect.width())
-        oy = int(ry * h / img_rect.height())
-        return QPoint(max(0, min(ox, w - 1)), max(0, min(oy, h - 1)))
-
-    def _image_to_display(self, pt: QPoint) -> QPoint:
-        """Convert original image coordinates to display coordinates."""
-        if not self._orig_shape or not self._scaled_pixmap:
-            return pt
-        img_rect = self._get_image_rect()
-        h, w = self._orig_shape
-        dx = img_rect.x() + int(pt.x() * img_rect.width() / w)
-        dy = img_rect.y() + int(pt.y() * img_rect.height() / h)
-        return QPoint(dx, dy)
-
     def enable_roi_selection(self, enabled: bool) -> None:
-        """Enable or disable ROI selection mode."""
         self._roi_enabled = enabled
-        if enabled:
-            self.setMouseTracking(True)
-            self.setCursor(Qt.CrossCursor)
-        else:
-            self.setMouseTracking(False)
-            self.setCursor(Qt.ArrowCursor)
-            self._is_drawing = False
-            self._temp_rect = None
+        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
 
     def set_selected_ball(self, index: Optional[int]) -> None:
-        """Highlight a specific ball by index."""
         self._selected_ball_index = index
-        self._redraw_overlay()
+        self.update()
+
+    def overlay_results(self, result: AnalysisResult) -> None:
+        self._last_result = result
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#050505"))
+        
+        if not self._raw_image:
+            painter.setPen(QColor("#666"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No Image Loaded")
+            return
+
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        w, h = self.width(), self.height()
+        iw, ih = self._raw_image.width(), self._raw_image.height()
+        
+        scale_w = w / iw
+        scale_h = h / ih
+        self._fit_scale = min(scale_w, scale_h) * 0.95
+        
+        real_scale = self._fit_scale * self._zoom
+        
+        target_w = iw * real_scale
+        target_h = ih * real_scale
+        base_x = (w - target_w) / 2
+        base_y = (h - target_h) / 2
+        
+        self._draw_offset = QPointF(base_x, base_y) + self._pan
+        
+        painter.translate(self._draw_offset)
+        painter.scale(real_scale, real_scale)
+        
+        painter.drawImage(0, 0, self._raw_image)
+        
+        pen_width = 2.0 / real_scale
+        
+        if self._roi_rect:
+            pen = QPen(QColor("#ffff00"), pen_width)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self._roi_rect)
+            
+        if self._temp_roi_rect:
+            pen = QPen(QColor("#ffff00"), pen_width)
+            pen.setStyle(Qt.DotLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self._temp_roi_rect)
+
+        if self._last_result:
+            for ball in self._last_result.valid_balls + self._last_result.invalid_balls:
+                self.draw_ball(painter, ball, pen_width)
+
+    def draw_ball(self, painter, ball, pen_scale):
+        is_selected = (ball.index == self._selected_ball_index)
+        
+        if ball.valid:
+            color = QColor("#2ecc71")
+            if is_selected:
+                width = 3.0 * pen_scale
+                radius = (ball.diameter_px / 2.0) + 4.0
+            else:
+                width = 1.0 * pen_scale
+                radius = (ball.diameter_px / 2.0) + 1.0
+        else:
+            # 只在选中或非常明显时显示无效小球，或者半透明
+            if is_selected:
+                color = QColor("#ff00ff")
+                width = 2.0 * pen_scale
+                radius = (ball.diameter_px / 2.0) + 2.0
+            else:
+                color = QColor("#e74c3c")
+                color.setAlpha(60) # 更淡的红色
+                width = 1.0 * pen_scale
+                radius = (ball.diameter_px / 2.0)
+                
+        painter.setPen(QPen(color, width))
+        painter.setBrush(Qt.NoBrush)
+        center = QPointF(ball.x_px, ball.z_px)
+        painter.drawEllipse(center, radius, radius)
+
+    def _display_to_image(self, pos: QPointF) -> QPointF:
+        if not self._raw_image or self._fit_scale == 0:
+            return QPointF(-1, -1)
+        real_scale = self._fit_scale * self._zoom
+        img_pos = (pos - self._draw_offset) / real_scale
+        return img_pos
+
+    def wheelEvent(self, event) -> None:
+        if not self._raw_image: return
+        delta = event.angleDelta().y()
+        factor = 1.1 if delta > 0 else 0.9
+        
+        mouse_pos = event.position()
+        
+        # Zoom centered on mouse logic
+        # Current origin: self._draw_offset
+        # Vector from origin to mouse: v = mouse - origin
+        # New vector: v' = v * factor
+        # Shift origin: diff = v - v'
+        
+        origin = self._draw_offset
+        v = mouse_pos - origin
+        v_new = v * factor
+        diff = v - v_new
+        
+        self._pan += diff
+        self._zoom *= factor
+        
+        if self._zoom < 0.1: self._zoom = 0.1
+        if self._zoom > 50.0: self._zoom = 50.0
+        
+        self.update()
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton and self._raw_pixmap and self._roi_enabled:
-            img_pt = self._display_to_image(event.position().toPoint())
-            if img_pt:
-                self._is_drawing = True
-                self._draw_start = event.position().toPoint()
-                self._temp_rect = QRect(event.position().toPoint(), event.position().toPoint())
-                self._roi_rect = None  # Clear previous ROI
-                self._redraw_overlay()
+        if not self._raw_image: return
+        
+        if event.button() == Qt.RightButton:
+            self._is_panning = True
+            self._last_mouse_pos = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            
+        elif event.button() == Qt.LeftButton and self._roi_enabled:
+            img_pos = self._display_to_image(event.position())
+            rect = QRectF(0, 0, self._raw_image.width(), self._raw_image.height())
+            if rect.contains(img_pos):
+                self._is_drawing_roi = True
+                self._roi_start = img_pos
+                self._temp_roi_rect = QRectF(img_pos, img_pos).toRect()
+                self._roi_rect = None
+                self.update()
 
     def mouseMoveEvent(self, event) -> None:
-        if self._is_drawing and self._draw_start and self._roi_enabled:
-            self._temp_rect = QRect(self._draw_start, event.position().toPoint()).normalized()
-            self._redraw_overlay()
+        if self._is_panning:
+            delta = event.position() - self._last_mouse_pos
+            self._pan += delta
+            self._last_mouse_pos = event.position()
+            self.update()
+            
+        elif self._is_drawing_roi:
+            curr_pos = self._display_to_image(event.position())
+            x = int(min(self._roi_start.x(), curr_pos.x()))
+            y = int(min(self._roi_start.y(), curr_pos.y()))
+            w = int(abs(curr_pos.x() - self._roi_start.x()))
+            h = int(abs(curr_pos.y() - self._roi_start.y()))
+            self._temp_roi_rect = QRect(x, y, w, h)
+            self.update()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton and self._is_drawing and self._roi_enabled:
-            self._is_drawing = False
-            if self._temp_rect and self._temp_rect.width() > 5 and self._temp_rect.height() > 5:
-                # Convert to image coordinates
-                tl = self._display_to_image(self._temp_rect.topLeft())
-                br = self._display_to_image(self._temp_rect.bottomRight())
-                if tl and br:
-                    self._roi_rect = QRect(tl, br).normalized()
-                    self.roi_changed.emit(self.get_roi())
-                    # Keep ROI selection enabled for re-selection
-            self._temp_rect = None
-            self._redraw_overlay()
-
+        if event.button() == Qt.RightButton and self._is_panning:
+            self._is_panning = False
+            self.setCursor(Qt.ArrowCursor if not self._roi_enabled else Qt.CrossCursor)
+            
+        elif event.button() == Qt.LeftButton and self._is_drawing_roi:
+            self._is_drawing_roi = False
+            if self._temp_roi_rect and self._temp_roi_rect.width() > 5 and self._temp_roi_rect.height() > 5:
+                iw, ih = self._raw_image.width(), self._raw_image.height()
+                r = self._temp_roi_rect
+                final_x = max(0, min(r.x(), iw-1))
+                final_y = max(0, min(r.y(), ih-1))
+                final_w = min(r.width(), iw - final_x)
+                final_h = min(r.height(), ih - final_y)
+                
+                self._roi_rect = QRect(final_x, final_y, final_w, final_h)
+                self.roi_changed.emit(self.get_roi())
+            self._temp_roi_rect = None
+            self.update()
+    
     def _to_qimage(self, image: np.ndarray) -> QImage:
         """Normalize numpy image to QImage (grayscale or RGB)."""
         if image.ndim == 2:
@@ -245,104 +341,7 @@ class ImageCanvas(QWidget):
         self._buffer = arr_c
         return QImage(self._buffer.data, w, h, ch * w, QImage.Format_RGB888)
 
-    def _update_scaled_pixmap(self) -> None:
-        if not self._raw_pixmap:
-            return
-        # Fix: Allow both scaling up and down
-        target_size = self.size()
-        scaled = self._raw_pixmap.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._scaled_pixmap = scaled
-        self._redraw_overlay()
 
-    def _redraw_overlay(self) -> None:
-        if not self._scaled_pixmap:
-            return
-        
-        base = self._scaled_pixmap.copy()
-        painter = QPainter(base)
-        painter.setRenderHint(QPainter.Antialiasing)
-        
-        img_rect = self._get_image_rect()
-        h, w = self._orig_shape if self._orig_shape else (1, 1)
-        sx = img_rect.width() / max(w, 1)
-        sy = img_rect.height() / max(h, 1)
-        
-        # Draw ROI rectangle (dashed yellow, no fill)
-        if self._roi_rect and self._orig_shape:
-            pen = QPen(QColor("#f59e0b"))
-            pen.setWidth(2)
-            pen.setStyle(Qt.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)  # No fill
-            
-            # Convert ROI to display coordinates
-            rx = int(self._roi_rect.x() * sx)
-            ry = int(self._roi_rect.y() * sy)
-            rw = int(self._roi_rect.width() * sx)
-            rh = int(self._roi_rect.height() * sy)
-            painter.drawRect(rx, ry, rw, rh)
-        
-        # Draw temp rect while dragging (dashed white)
-        if self._temp_rect and self._is_drawing:
-            pen = QPen(QColor("#ffffff"))
-            pen.setWidth(1)
-            pen.setStyle(Qt.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            # Adjust temp rect relative to image position
-            adj_rect = self._temp_rect.translated(-img_rect.x(), -img_rect.y())
-            painter.drawRect(adj_rect)
-        
-        # Draw analysis results
-        if self._last_result and self._orig_shape:
-            scale_factor = self._last_result.upsample_factor
-            roi_offset_x = self._roi_rect.x() if self._roi_rect else 0
-            roi_offset_y = self._roi_rect.y() if self._roi_rect else 0
-
-            def _draw_ball(ball: BallMeasurement, color: QColor) -> None:
-                # Map from ROI-relative upsampled coords to original image coords
-                orig_x = (ball.x_px / scale_factor) + roi_offset_x
-                orig_y = (ball.z_px / scale_factor) + roi_offset_y
-                cx = orig_x * sx
-                cy = orig_y * sy
-                radius = (ball.diameter_px or 4.0) / (2.0 * scale_factor)
-                r_scaled = max(radius * (sx + sy) / 2.0, 2.0)
-                
-                # Highlight if selected
-                if self._selected_ball_index is not None and ball.index == self._selected_ball_index:
-                    # Draw larger circle for selected ball
-                    highlight_pen = QPen(color)
-                    highlight_pen.setWidth(4)
-                    painter.setPen(highlight_pen)
-                    painter.drawEllipse(
-                        int(round(cx - r_scaled * 1.3)),
-                        int(round(cy - r_scaled * 1.3)),
-                        int(round(2 * r_scaled * 1.3)),
-                        int(round(2 * r_scaled * 1.3)),
-                    )
-                
-                pen = QPen(color)
-                pen.setWidth(2)
-                painter.setPen(pen)
-                painter.drawEllipse(
-                    int(round(cx - r_scaled)),
-                    int(round(cy - r_scaled)),
-                    int(round(2 * r_scaled)),
-                    int(round(2 * r_scaled)),
-                )
-                # Remove ball index label
-
-            for ball in self._last_result.valid_balls:
-                _draw_ball(ball, QColor("#4cd137"))
-            for ball in self._last_result.invalid_balls:
-                _draw_ball(ball, QColor("#ff6b6b"))
-        
-        painter.end()
-        self._label.setPixmap(base)
-
-    def overlay_results(self, result: AnalysisResult) -> None:
-        self._last_result = result
-        self._redraw_overlay()
 
 
 class CenterPanel(QWidget):
@@ -824,10 +823,27 @@ class StatsPanel(QWidget):
         self.lbl_mean._value_label.setText(mean_text)  # type: ignore[attr-defined]
         self.lbl_std._value_label.setText(std_text)  # type: ignore[attr-defined]
         self.lbl_algo.setText(f"算法版本: {result.algorithm_version}")
+        
+        # 显示筛选统计
+        warn_text = ""
+        if hasattr(result, "filter_stats") and result.filter_stats:
+            stats = result.filter_stats
+            stats_text = (
+                f"筛选统计:\n"
+                f"检测总数: {stats.get('total_detected', 0)}\n"
+                f"半径过滤: -{stats.get('radius_rejected', 0)}\n"
+                f"SNR过滤: -{stats.get('snr_rejected', 0)}\n"
+                f"边界剔除: -{stats.get('boundary_rejected', 0)}\n"
+                f"暗目标剔除: -{stats.get('dim_target_rejected', 0)}\n"
+                f"拟合失败: -{stats.get('fit_rejected', 0)}\n"
+                f"锐度过低: -{stats.get('profile_low_sharpness', 0)}"
+            )
+            warn_text += stats_text + "\n\n"
+            
         if result.warnings:
-            self.warnings.setText("警告: " + "; ".join(result.warnings))
-        else:
-            self.warnings.setText("")
+            warn_text += "警告: " + "; ".join(result.warnings)
+        
+        self.warnings.setText(warn_text)
 
 
 class ResultTable(QTableWidget):
