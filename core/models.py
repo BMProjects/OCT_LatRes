@@ -1,3 +1,15 @@
+"""OCT 分辨率计量数据模型 (v1.0)
+
+定义算法配置、测量结果和物理参数的数据结构。
+所有物理量统一使用 µm 单位，像素量使用 px 单位。
+
+Classes:
+    PhysicalConfig: 物理参数配置 (像素标尺、靶球直径等)
+    DetectionParams: DoG 检测参数
+    AnalysisConfig: 完整算法配置
+    BallMeasurement: 单个微球测量结果
+    AnalysisResult: 整体分析结果集合
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

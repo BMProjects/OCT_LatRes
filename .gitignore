@@ -5,6 +5,7 @@
 # Generated/temporary data
 data_samples/
 debug_outputs/
+analysis_results/
 
 # Python cache
 __pycache__/

@@ -1,14 +1,24 @@
-"""核心入口：负责 orchestrate 检测、截面提取、FWHM 以及统计输出。
+"""OCT 横向分辨率计量核心算法模块 (v1.0)
 
-模块划分的思路：
-- 将检测、profile、FWHM 各自封装成独立模块，保持依赖透明；
-- `run_analysis` 提供 v1 正式算法（DoG + 离散 FWHM）；
-- `_compute_statistics` 提供统一统计逻辑，方便 GUI / 报告层共用。
+Core analysis pipeline for OCT lateral resolution measurement using microsphere
+phantom images. Implements DoG blob detection, multi-stage filtering, and
+sub-pixel FWHM extraction.
 
-改进 v1.1:
-- SNR自适应峰值阈值，替换固定0.5
-- 单峰性检测，过滤多峰噪声
-- 0-1置信度评分系统
+算法流程:
+    1. DoG 斑点检测 - 识别候选微球
+    2. 半径筛选 - 剔除尺寸异常点
+    3. SNR 筛选 - 确保信号质量 (SNR > 8.0)
+    4. 边界筛选 - 剔除边缘不完整目标
+    5. 相对强度筛选 - 过滤暗弱目标
+    6. 2D 高斯拟合 - 亚像素定位与形态验证
+    7. Profile FWHM - 横向分辨率提取
+
+物理背景:
+    - 微球在 OCT B-scan 中呈现为高斯光斑 (PSF 卷积结果)
+    - FWHM = 2√(2ln2)·σ ≈ 2.355σ (高斯标准差到半高宽)
+    - 深层信号受 SNR roll-off 影响，测量值会人为偏小
+
+Dependencies: numpy, scipy, skimage
 """
 from __future__ import annotations
 

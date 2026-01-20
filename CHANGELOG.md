@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.0.0 (2026-01-20) - 首个稳定里程碑
+
+### 代码架构规范化
+
+- **模块注释**: 为 `core/analysis.py`, `core/models.py`, `app/main.py` 添加 v1.0 模块级 docstring
+- **代码清理**: 归档实验性脚本至 `archive/`，清理临时输出目录
+- **单位规范**: 统一物理量使用 µm，像素量使用 px
+
+### 文档整合
+
+- 新增 `docs/01_PROJECT_OVERVIEW.md` - 项目总览与快速开始
+- 新增 `docs/02_ALGORITHM_THEORY.md` - 物理原理与算法详解
+- 新增 `docs/03_EXPERIMENTAL_DATA.md` - 实验数据与分析
+- 新增 `docs/04_KNOWN_ISSUES.md` - 已知问题与优化方向
+- 归档旧文档至 `docs/archive/`
+
+### 已知问题
+
+- SNR 截断效应：深层低 SNR 数据产生偏小的 FWHM 读数（详见 `04_KNOWN_ISSUES.md`）
+
+---
+
 ## v0.1.2
 
 ### 前端优化

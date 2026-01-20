@@ -1,9 +1,20 @@
-"""PySide6 GUI (modern dark theme) wired to the existing AnalysisService and core pipeline.
+"""OCT 横向分辨率计量 GUI 主程序 (v1.0)
 
-Features:
-- Dark, flattened UI with clear separation of controls, image preview, stats, and logs.
-- Uses existing AnalysisService/run_baseline; updates pixel scale before analysis.
-- Background thread to keep UI responsive; overlays valid/invalid balls on the preview.
+PySide6 图形界面，实现交互式参数配置、图像预览和结果可视化。
+
+组件架构:
+    - ImageCanvas: 图像显示与 ROI 选择
+    - CenterPanel: 图像预览与工具栏
+    - ControlPanel: 参数输入控件
+    - StatsPanel: 统计结果展示
+    - ResultTable: 微球测量列表
+    - MainWindow: 主窗口布局与信号连接
+
+特性:
+    - 深色现代化 UI 风格
+    - 后台线程分析，UI 不阻塞
+    - 有效/无效微球叠加显示
+    - 实时 ROI 尺寸反馈
 """
 from __future__ import annotations
 
