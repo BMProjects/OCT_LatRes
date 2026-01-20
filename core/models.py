@@ -109,7 +109,6 @@ class AnalysisResult:
     n_valid: int = 0
     algorithm_version: str = "v0"
     warnings: List[str] = field(default_factory=list)
-    filter_stats: Dict[str, int] = field(default_factory=dict)  # 各筛选步骤的拒绝数量统计
     upsample_factor: int = 1  # 图像上采样因子，用于前端坐标缩放
 
 

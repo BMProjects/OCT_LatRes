@@ -74,6 +74,7 @@ def run_analysis(
     logger.info(
         f"after radius filter: {len(candidates)} kept / {len(measurements)} total | median={r_med:.2f}px"
     )
+    print(f"[筛选统计] 1. 半径筛选: {len(measurements)} → {len(candidates)} (拒绝 {len(rejected_radius)})")
     invalid.extend(rejected_radius)
     if progress_cb:
         progress_cb(f"半径筛选 {len(candidates)}/{len(measurements)}")
@@ -83,6 +84,7 @@ def run_analysis(
         f"after peak filter: {len(candidates)} kept | "
         f"peak stats min/median/max={peak_stats[0]:.3f}/{peak_stats[1]:.3f}/{peak_stats[2]:.3f}"
     )
+    print(f"[筛选统计] 2. SNR筛选: 拒绝 {len(rejected_peak)} (剩余 {len(candidates)})")
     invalid.extend(rejected_peak)
     if progress_cb:
         progress_cb(f"峰值筛选 {len(candidates)}")
@@ -90,25 +92,18 @@ def run_analysis(
     # 新增：边界剔除
     candidates, rejected_boundary = _filter_by_boundary(gray_image, candidates)
     logger.info(f"after boundary filter: {len(candidates)} kept")
+    print(f"[筛选统计] 3. 边界剔除: 拒绝 {len(rejected_boundary)} (剩余 {len(candidates)})")
     invalid.extend(rejected_boundary)
     if progress_cb:
         progress_cb(f"边界筛选 {len(candidates)}")
     
     # 新增：相对亮度筛选
-    candidates, rejected_rel_intensity = _filter_by_relative_intensity(candidates, percentile=90.0, threshold_ratio=0.4)
+    candidates, rejected_rel_intensity = _filter_by_relative_intensity(candidates, percentile=90.0, threshold_ratio=0.35)
     logger.info(f"after relative intensity filter: {len(candidates)} kept")
+    print(f"[筛选统计] 4. 相对亮度筛选: 拒绝 {len(rejected_rel_intensity)} (剩余 {len(candidates)})")
     invalid.extend(rejected_rel_intensity)
     if progress_cb:
         progress_cb(f"相对亮度筛选 {len(candidates)}")
-    
-    # 统计筛选结果
-    filter_stats = {
-        "total_detected": len(measurements),
-        "radius_rejected": len(rejected_radius),
-        "snr_rejected": len(rejected_peak),
-        "boundary_rejected": len(rejected_boundary),
-        "dim_target_rejected": len(rejected_rel_intensity),
-    }
 
     candidates, rejected_fit, fit_stats = _filter_by_gaussian_fit(gray_image, candidates, config)
     logger.info(
@@ -117,8 +112,7 @@ def run_analysis(
         f"median sigma={fit_stats['sigma_med']:.2f}px median residual={fit_stats['residual_med']:.3f} "
         f"median fwhm={fit_stats['fwhm_med']:.2f}px"
     )
-    fit_rejected_count = len(rejected_fit)
-    filter_stats["fit_rejected"] = fit_rejected_count
+    print(f"[筛选统计] 5. 2D高斯拟合: 拒绝 {len(rejected_fit)} (剩余 {len(candidates)})")
     invalid.extend(rejected_fit)
     if progress_cb:
         progress_cb(f"2D 拟合筛选 {len(candidates)}")
@@ -183,10 +177,10 @@ def run_analysis(
     logger.info(f"after profile/FWHM: {passed_profile} kept")
     if failure_counts:
         logger.info(f"profile/FWHM failure stats: {dict(failure_counts)}")
-        # Merge detailed failure counts into filter_stats for display
-        for reason, count in failure_counts.items():
-            filter_stats[f"profile_{reason}"] = count
-    
+        print(f"[筛选统计] 6. Profile/FWHM筛选:")
+        for reason, count in sorted(failure_counts.items()):
+            print(f"   - {reason}: {count}")
+        print(f"   → 最终通过: {passed_profile}")
     if progress_cb:
         progress_cb(f"Profile/FWHM 完成 {len(valid)}")
 
@@ -195,7 +189,6 @@ def run_analysis(
         invalid_balls=invalid,
         n_valid=len(valid),
         algorithm_version="v1 (DoG + discrete FWHM)",
-        filter_stats=filter_stats,
         upsample_factor=upsample_factor,
     )
     result.n_valid = len(valid)
@@ -211,6 +204,12 @@ def run_analysis(
         result.warnings.append(
             f"Only {len(valid)} valid balls detected (requires >= {config.min_valid_balls})."
         )
+    
+    # 输出筛选总结
+    print(f"\n{'='*60}")
+    print(f"[筛选总结] 检测总数: {len(measurements)} → 最终有效: {len(valid)} (拒绝: {len(invalid)})")
+    print(f"{'='*60}\n")
+    
     return result
 
 
@@ -277,7 +276,7 @@ def _filter_by_peak_intensity(
     gray_image: np.ndarray,
     measurements: List[BallMeasurement],
     config: AnalysisConfig,
-    snr_factor: float = 6.0,  # 从4.0提高到6.0，更严格过滤散斑
+    snr_factor: float = 8.0,  # 从6.0提高到8.0，更严格过滤散斑
 ) -> Tuple[List[BallMeasurement], List[BallMeasurement], Tuple[float, float, float]]:
     """SNR自适应峰值过滤，替换固定阈值0.5。
 
@@ -552,14 +551,14 @@ def _filter_by_gaussian_fit(
         fwhms.append(fit["fwhm_px"])
 
         expected_sigma = max(m.psf_radius_px if m.psf_radius_px else fit["sigma_x"], 1.0)
-        lower_sigma = max(0.5, 0.5 * expected_sigma)
-        upper_sigma = max(2.5 * expected_sigma, expected_sigma + 2.0)
+        lower_sigma = max(0.5, 0.3 * expected_sigma)
+        upper_sigma = max(3.0 * expected_sigma, expected_sigma + 3.0)
         sigma_ok = lower_sigma <= fit["sigma_x"] <= upper_sigma and lower_sigma <= fit["sigma_y"] <= upper_sigma
-        # 期望纵向拉长：y 轴（行方向）应不小于 x 轴
+        # 期望纵向拉长：y 轴（行方向）应不小于 x 轴 (允许少量横向拉长/像散)
         vertical_elongation = fit["sigma_y"] / max(fit["sigma_x"], 1e-6)
-        axis_ok = 1.0 <= fit["axis_ratio"] <= 3.0 and vertical_elongation >= 1.0
+        axis_ok = 1.0 <= fit["axis_ratio"] <= 3.0 and vertical_elongation >= 0.8
         amp_ok = fit["amp"] >= 0.08 and fit["snr"] >= snr_threshold
-        residual_ok = fit["residual"] <= 0.25
+        residual_ok = fit["residual"] <= 0.50
         fwhm_ok = fwhm_min_px <= fit["fwhm_px"] <= fwhm_max_px
 
         if sigma_ok and axis_ok and amp_ok and residual_ok and fwhm_ok:

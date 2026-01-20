@@ -7,27 +7,6 @@ This repository hosts the v0.1.0 prototype for the ophthalmic OCT lateral resolu
 - visualise a preview in a PySide6 GUI
 - export structured data for further analysis (CSV export stub coming next)
 
-## v0.2.0 更新 (2025-01-19)
-
-### 新增功能
-
-- **交互式GUI**: 支持ROI选取、移动、清除；支持运行锁定。
-- **图像浏览增强**: 支持鼠标滚轮缩放查看细节，右键拖拽平移。
-- **高级筛选算法**:
-  - **相对亮度筛选**: 自动剔除低亮度的散斑和噪声。
-  - **锐度筛选**: 剔除边缘模糊的虚焦/旁瓣目标。
-  - **边界与重叠处理**: 自动排除边界截断目标，增强重叠球检测。
-- **统计面板**: 实时显示筛选流程的拒绝统计信息。
-
-### 使用方法
-
-1. **加载图像**: 支持 16-bit TIFF/PNG。
-2. **设置ROI** (可选): 左键拖拽选择感兴趣区域。
-3. **运行分析**: 点击 "Run Analysis"。
-   - 算法将自动执行多级筛选。
-   - 结果会显示在统计面板和右侧直方图。
-4. **查看细节**: 滚轮缩放图像，点击表格中的行定位具体靶球。
-
 ## Project layout
 
 ```

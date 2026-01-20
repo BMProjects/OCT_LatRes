@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QThread, QPoint, QRect, QPointF, QRectF
+from PySide6.QtCore import Qt, Signal, QThread, QPoint, QRect
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QBrush
 from PySide6.QtWidgets import (
     QApplication,
@@ -79,248 +79,153 @@ QLabel#ROIInfo { font-family: Consolas, monospace; font-size: 11px; color: #f59e
 
 
 class ImageCanvas(QWidget):
-    """Centered image preview with ROI selection, overlay, and zoom/pan support."""
+    """Centered image preview with ROI selection and overlay support."""
 
     roi_changed = Signal(object)  # Emits (x, y, w, h) tuple or None
 
     def __init__(self) -> None:
         super().__init__()
-        self.setMouseTracking(True)
-        self.setBackgroundRole(QPalette.Dark)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        
-        # Data
-        self._raw_image: Optional[QImage] = None
-        self._last_result: Optional[AnalysisResult] = None
-        self._selected_ball_index: Optional[int] = None
-        self._buffer: Optional[np.ndarray] = None
-        
-        # View state
-        self._zoom: float = 1.0
-        self._pan: QPointF = QPointF(0, 0)
-        self._fit_scale: float = 1.0
-        self._draw_offset: QPointF = QPointF(0, 0)
-        
-        # Interaction
-        self._is_panning: bool = False
-        self._last_mouse_pos: QPointF = QPointF()
-        
-        # ROI
-        self._roi_enabled: bool = False
-        self._is_drawing_roi: bool = False
-        self._roi_rect: Optional[QRect] = None
-        self._temp_roi_rect: Optional[QRect] = None
-        self._roi_start: QPointF = QPointF()
-        
+        self.setAutoFillBackground(True)
+        self.setStyleSheet("background-color: #050505;")
+        self.setMouseTracking(False)  # Initially disabled
         self.setCursor(Qt.ArrowCursor)
+        
+        self._raw_pixmap: Optional[QPixmap] = None
+        self._scaled_pixmap: Optional[QPixmap] = None
+        self._orig_shape: Optional[tuple[int, int]] = None  # (h, w)
+        self._last_result: Optional[AnalysisResult] = None
+        self._selected_ball_index: Optional[int] = None  # For highlighting
+        
+        # ROI state
+        self._roi_enabled: bool = False  # ROI selection mode
+        self._roi_rect: Optional[QRect] = None  # In original image coordinates
+        self._is_drawing: bool = False
+        self._draw_start: Optional[QPoint] = None
+        self._temp_rect: Optional[QRect] = None  # Current drawing rect (display coords)
+        
+        self._label = QLabel("加载一张 OCT 图像以开始")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setStyleSheet("color: #555; font-size: 14px;")
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)  # 允许缩小
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._label)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
 
     def set_image(self, image: np.ndarray) -> None:
-        self._raw_image = self._to_qimage(image)
+        self._orig_shape = image.shape[:2]
         self._last_result = None
         self._roi_rect = None
-        self._temp_roi_rect = None
-        self._selected_ball_index = None
-        self._zoom = 1.0
-        self._pan = QPointF(0, 0)
-        self.update()
+        self._temp_rect = None
+        qimage = self._to_qimage(image)
+        self._raw_pixmap = QPixmap.fromImage(qimage)
+        self._update_scaled_pixmap()
         self.roi_changed.emit(None)
 
     def clear_roi(self) -> None:
+        """Clear the current ROI selection."""
         self._roi_rect = None
-        self._temp_roi_rect = None
-        self.update()
+        self._temp_rect = None
+        self._redraw_overlay()
         self.roi_changed.emit(None)
 
     def clear_results(self) -> None:
+        """Clear analysis results overlay."""
         self._last_result = None
-        self.update()
+        self._redraw_overlay()
 
     def get_roi(self) -> Optional[tuple]:
+        """Get current ROI as (x, y, w, h) in original image coordinates."""
         if self._roi_rect:
-            x, y, w, h = self._roi_rect.getRect()
-            return (int(x), int(y), int(w), int(h))
+            return (self._roi_rect.x(), self._roi_rect.y(), 
+                    self._roi_rect.width(), self._roi_rect.height())
         return None
 
+    def _get_image_rect(self) -> QRect:
+        """Get the rectangle where the image is displayed."""
+        if not self._scaled_pixmap:
+            return QRect()
+        pw, ph = self._scaled_pixmap.width(), self._scaled_pixmap.height()
+        x = (self.width() - pw) // 2
+        y = (self.height() - ph) // 2
+        return QRect(x, y, pw, ph)
+
+    def _display_to_image(self, pos: QPoint) -> Optional[QPoint]:
+        """Convert display coordinates to original image coordinates."""
+        if not self._orig_shape or not self._scaled_pixmap:
+            return None
+        img_rect = self._get_image_rect()
+        if not img_rect.contains(pos):
+            return None
+        # Relative position within scaled image
+        rx = pos.x() - img_rect.x()
+        ry = pos.y() - img_rect.y()
+        # Scale to original image
+        h, w = self._orig_shape
+        ox = int(rx * w / img_rect.width())
+        oy = int(ry * h / img_rect.height())
+        return QPoint(max(0, min(ox, w - 1)), max(0, min(oy, h - 1)))
+
+    def _image_to_display(self, pt: QPoint) -> QPoint:
+        """Convert original image coordinates to display coordinates."""
+        if not self._orig_shape or not self._scaled_pixmap:
+            return pt
+        img_rect = self._get_image_rect()
+        h, w = self._orig_shape
+        dx = img_rect.x() + int(pt.x() * img_rect.width() / w)
+        dy = img_rect.y() + int(pt.y() * img_rect.height() / h)
+        return QPoint(dx, dy)
+
     def enable_roi_selection(self, enabled: bool) -> None:
+        """Enable or disable ROI selection mode."""
         self._roi_enabled = enabled
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        if enabled:
+            self.setMouseTracking(True)
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setMouseTracking(False)
+            self.setCursor(Qt.ArrowCursor)
+            self._is_drawing = False
+            self._temp_rect = None
 
     def set_selected_ball(self, index: Optional[int]) -> None:
+        """Highlight a specific ball by index."""
         self._selected_ball_index = index
-        self.update()
-
-    def overlay_results(self, result: AnalysisResult) -> None:
-        self._last_result = result
-        self.update()
-
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#050505"))
-        
-        if not self._raw_image:
-            painter.setPen(QColor("#666"))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No Image Loaded")
-            return
-
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
-
-        w, h = self.width(), self.height()
-        iw, ih = self._raw_image.width(), self._raw_image.height()
-        
-        scale_w = w / iw
-        scale_h = h / ih
-        self._fit_scale = min(scale_w, scale_h) * 0.95
-        
-        real_scale = self._fit_scale * self._zoom
-        
-        target_w = iw * real_scale
-        target_h = ih * real_scale
-        base_x = (w - target_w) / 2
-        base_y = (h - target_h) / 2
-        
-        self._draw_offset = QPointF(base_x, base_y) + self._pan
-        
-        painter.translate(self._draw_offset)
-        painter.scale(real_scale, real_scale)
-        
-        painter.drawImage(0, 0, self._raw_image)
-        
-        pen_width = 2.0 / real_scale
-        
-        if self._roi_rect:
-            pen = QPen(QColor("#ffff00"), pen_width)
-            pen.setStyle(Qt.DashLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(self._roi_rect)
-            
-        if self._temp_roi_rect:
-            pen = QPen(QColor("#ffff00"), pen_width)
-            pen.setStyle(Qt.DotLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(self._temp_roi_rect)
-
-        if self._last_result:
-            for ball in self._last_result.valid_balls + self._last_result.invalid_balls:
-                self.draw_ball(painter, ball, pen_width)
-
-    def draw_ball(self, painter, ball, pen_scale):
-        is_selected = (ball.index == self._selected_ball_index)
-        
-        if ball.valid:
-            color = QColor("#2ecc71")
-            if is_selected:
-                width = 3.0 * pen_scale
-                radius = (ball.diameter_px / 2.0) + 4.0
-            else:
-                width = 1.0 * pen_scale
-                radius = (ball.diameter_px / 2.0) + 1.0
-        else:
-            # 只在选中或非常明显时显示无效小球，或者半透明
-            if is_selected:
-                color = QColor("#ff00ff")
-                width = 2.0 * pen_scale
-                radius = (ball.diameter_px / 2.0) + 2.0
-            else:
-                color = QColor("#e74c3c")
-                color.setAlpha(60) # 更淡的红色
-                width = 1.0 * pen_scale
-                radius = (ball.diameter_px / 2.0)
-                
-        painter.setPen(QPen(color, width))
-        painter.setBrush(Qt.NoBrush)
-        center = QPointF(ball.x_px, ball.z_px)
-        painter.drawEllipse(center, radius, radius)
-
-    def _display_to_image(self, pos: QPointF) -> QPointF:
-        if not self._raw_image or self._fit_scale == 0:
-            return QPointF(-1, -1)
-        real_scale = self._fit_scale * self._zoom
-        img_pos = (pos - self._draw_offset) / real_scale
-        return img_pos
-
-    def wheelEvent(self, event) -> None:
-        if not self._raw_image: return
-        delta = event.angleDelta().y()
-        factor = 1.1 if delta > 0 else 0.9
-        
-        mouse_pos = event.position()
-        
-        # Zoom centered on mouse logic
-        # Current origin: self._draw_offset
-        # Vector from origin to mouse: v = mouse - origin
-        # New vector: v' = v * factor
-        # Shift origin: diff = v - v'
-        
-        origin = self._draw_offset
-        v = mouse_pos - origin
-        v_new = v * factor
-        diff = v - v_new
-        
-        self._pan += diff
-        self._zoom *= factor
-        
-        if self._zoom < 0.1: self._zoom = 0.1
-        if self._zoom > 50.0: self._zoom = 50.0
-        
-        self.update()
+        self._redraw_overlay()
 
     def mousePressEvent(self, event) -> None:
-        if not self._raw_image: return
-        
-        if event.button() == Qt.RightButton:
-            self._is_panning = True
-            self._last_mouse_pos = event.position()
-            self.setCursor(Qt.ClosedHandCursor)
-            
-        elif event.button() == Qt.LeftButton and self._roi_enabled:
-            img_pos = self._display_to_image(event.position())
-            rect = QRectF(0, 0, self._raw_image.width(), self._raw_image.height())
-            if rect.contains(img_pos):
-                self._is_drawing_roi = True
-                self._roi_start = img_pos
-                self._temp_roi_rect = QRectF(img_pos, img_pos).toRect()
-                self._roi_rect = None
-                self.update()
+        if event.button() == Qt.LeftButton and self._raw_pixmap and self._roi_enabled:
+            img_pt = self._display_to_image(event.position().toPoint())
+            if img_pt:
+                self._is_drawing = True
+                self._draw_start = event.position().toPoint()
+                self._temp_rect = QRect(event.position().toPoint(), event.position().toPoint())
+                self._roi_rect = None  # Clear previous ROI
+                self._redraw_overlay()
 
     def mouseMoveEvent(self, event) -> None:
-        if self._is_panning:
-            delta = event.position() - self._last_mouse_pos
-            self._pan += delta
-            self._last_mouse_pos = event.position()
-            self.update()
-            
-        elif self._is_drawing_roi:
-            curr_pos = self._display_to_image(event.position())
-            x = int(min(self._roi_start.x(), curr_pos.x()))
-            y = int(min(self._roi_start.y(), curr_pos.y()))
-            w = int(abs(curr_pos.x() - self._roi_start.x()))
-            h = int(abs(curr_pos.y() - self._roi_start.y()))
-            self._temp_roi_rect = QRect(x, y, w, h)
-            self.update()
+        if self._is_drawing and self._draw_start and self._roi_enabled:
+            self._temp_rect = QRect(self._draw_start, event.position().toPoint()).normalized()
+            self._redraw_overlay()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.RightButton and self._is_panning:
-            self._is_panning = False
-            self.setCursor(Qt.ArrowCursor if not self._roi_enabled else Qt.CrossCursor)
-            
-        elif event.button() == Qt.LeftButton and self._is_drawing_roi:
-            self._is_drawing_roi = False
-            if self._temp_roi_rect and self._temp_roi_rect.width() > 5 and self._temp_roi_rect.height() > 5:
-                iw, ih = self._raw_image.width(), self._raw_image.height()
-                r = self._temp_roi_rect
-                final_x = max(0, min(r.x(), iw-1))
-                final_y = max(0, min(r.y(), ih-1))
-                final_w = min(r.width(), iw - final_x)
-                final_h = min(r.height(), ih - final_y)
-                
-                self._roi_rect = QRect(final_x, final_y, final_w, final_h)
-                self.roi_changed.emit(self.get_roi())
-            self._temp_roi_rect = None
-            self.update()
-    
+        if event.button() == Qt.LeftButton and self._is_drawing and self._roi_enabled:
+            self._is_drawing = False
+            if self._temp_rect and self._temp_rect.width() > 5 and self._temp_rect.height() > 5:
+                # Convert to image coordinates
+                tl = self._display_to_image(self._temp_rect.topLeft())
+                br = self._display_to_image(self._temp_rect.bottomRight())
+                if tl and br:
+                    self._roi_rect = QRect(tl, br).normalized()
+                    self.roi_changed.emit(self.get_roi())
+                    # Keep ROI selection enabled for re-selection
+            self._temp_rect = None
+            self._redraw_overlay()
+
     def _to_qimage(self, image: np.ndarray) -> QImage:
         """Normalize numpy image to QImage (grayscale or RGB)."""
         if image.ndim == 2:
@@ -341,7 +246,104 @@ class ImageCanvas(QWidget):
         self._buffer = arr_c
         return QImage(self._buffer.data, w, h, ch * w, QImage.Format_RGB888)
 
+    def _update_scaled_pixmap(self) -> None:
+        if not self._raw_pixmap:
+            return
+        # Fix: Allow both scaling up and down
+        target_size = self.size()
+        scaled = self._raw_pixmap.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._scaled_pixmap = scaled
+        self._redraw_overlay()
 
+    def _redraw_overlay(self) -> None:
+        if not self._scaled_pixmap:
+            return
+        
+        base = self._scaled_pixmap.copy()
+        painter = QPainter(base)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        img_rect = self._get_image_rect()
+        h, w = self._orig_shape if self._orig_shape else (1, 1)
+        sx = img_rect.width() / max(w, 1)
+        sy = img_rect.height() / max(h, 1)
+        
+        # Draw ROI rectangle (dashed yellow, no fill)
+        if self._roi_rect and self._orig_shape:
+            pen = QPen(QColor("#f59e0b"))
+            pen.setWidth(2)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)  # No fill
+            
+            # Convert ROI to display coordinates
+            rx = int(self._roi_rect.x() * sx)
+            ry = int(self._roi_rect.y() * sy)
+            rw = int(self._roi_rect.width() * sx)
+            rh = int(self._roi_rect.height() * sy)
+            painter.drawRect(rx, ry, rw, rh)
+        
+        # Draw temp rect while dragging (dashed white)
+        if self._temp_rect and self._is_drawing:
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidth(1)
+            pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            # Adjust temp rect relative to image position
+            adj_rect = self._temp_rect.translated(-img_rect.x(), -img_rect.y())
+            painter.drawRect(adj_rect)
+        
+        # Draw analysis results
+        if self._last_result and self._orig_shape:
+            scale_factor = self._last_result.upsample_factor
+            roi_offset_x = self._roi_rect.x() if self._roi_rect else 0
+            roi_offset_y = self._roi_rect.y() if self._roi_rect else 0
+
+            def _draw_ball(ball: BallMeasurement, color: QColor) -> None:
+                # Map from ROI-relative upsampled coords to original image coords
+                orig_x = (ball.x_px / scale_factor) + roi_offset_x
+                orig_y = (ball.z_px / scale_factor) + roi_offset_y
+                cx = orig_x * sx
+                cy = orig_y * sy
+                radius = (ball.diameter_px or 4.0) / (2.0 * scale_factor)
+                r_scaled = max(radius * (sx + sy) / 2.0, 2.0)
+                
+                # Highlight if selected
+                if self._selected_ball_index is not None and ball.index == self._selected_ball_index:
+                    # Draw larger circle for selected ball
+                    highlight_pen = QPen(color)
+                    highlight_pen.setWidth(4)
+                    painter.setPen(highlight_pen)
+                    painter.drawEllipse(
+                        int(round(cx - r_scaled * 1.3)),
+                        int(round(cy - r_scaled * 1.3)),
+                        int(round(2 * r_scaled * 1.3)),
+                        int(round(2 * r_scaled * 1.3)),
+                    )
+                
+                pen = QPen(color)
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawEllipse(
+                    int(round(cx - r_scaled)),
+                    int(round(cy - r_scaled)),
+                    int(round(2 * r_scaled)),
+                    int(round(2 * r_scaled)),
+                )
+                # Remove ball index label
+
+            for ball in self._last_result.valid_balls:
+                _draw_ball(ball, QColor("#4cd137"))
+            for ball in self._last_result.invalid_balls:
+                _draw_ball(ball, QColor("#ff6b6b"))
+        
+        painter.end()
+        self._label.setPixmap(base)
+
+    def overlay_results(self, result: AnalysisResult) -> None:
+        self._last_result = result
+        self._redraw_overlay()
 
 
 class CenterPanel(QWidget):
@@ -697,7 +699,9 @@ class ControlPanel(QWidget):
         layout.addLayout(btn_row)
 
         self.image_info = QLabel("未加载图像")
-        self.image_info.setStyleSheet("color:#aaa;")
+        self.image_info.setStyleSheet("color:#aaa; font-size: 10px;")
+        self.image_info.setWordWrap(True)
+        self.image_info.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         layout.addWidget(self.image_info)
 
         cfg_box = QGroupBox("基础参数")
@@ -713,19 +717,15 @@ class ControlPanel(QWidget):
         self.min_diam_input = QLineEdit(f"{default_config.detection.min_diameter_um:.2f}")
         self.max_diam_input = QLineEdit(f"{default_config.detection.max_diameter_um:.2f}")
         self.bg_thresh_input = QLineEdit(f"{default_config.detection.background_threshold:.0f}")
-        self.min_valid_input = QLineEdit(f"{default_config.min_valid_balls:d}")
         self.min_diam_input.setPlaceholderText("µm")
         self.max_diam_input.setPlaceholderText("µm")
         self.bg_thresh_input.setPlaceholderText("16-bit 灰度阈值")
-        self.min_valid_input.setPlaceholderText("最小有效数量")
         tune_layout.addWidget(QLabel("DoG 最小直径 (µm):"))
         tune_layout.addWidget(self.min_diam_input)
         tune_layout.addWidget(QLabel("DoG 最大直径 (µm):"))
         tune_layout.addWidget(self.max_diam_input)
         tune_layout.addWidget(QLabel("背景阈值 (16-bit):"))
         tune_layout.addWidget(self.bg_thresh_input)
-        tune_layout.addWidget(QLabel("最小有效小球数:"))
-        tune_layout.addWidget(self.min_valid_input)
         tune_box.setLayout(tune_layout)
 
         layout.addWidget(cfg_box)
@@ -746,7 +746,6 @@ class ControlPanel(QWidget):
                 "min_diameter_um": self._read_float(self.min_diam_input, positive=True),
                 "max_diameter_um": self._read_float(self.max_diam_input, positive=True),
                 "background_threshold": self._read_float(self.bg_thresh_input, positive=True),
-                "min_valid_balls": int(self._read_float(self.min_valid_input, positive=True)),
             }
         except ValueError:
             QMessageBox.warning(self, "输入错误", "请检查参数格式，必须为正数。")
@@ -774,11 +773,109 @@ class ControlPanel(QWidget):
         self.min_diam_input.setText(f"{cfg.detection.min_diameter_um:.2f}")
         self.max_diam_input.setText(f"{cfg.detection.max_diameter_um:.2f}")
         self.bg_thresh_input.setText(f"{cfg.detection.background_threshold:.0f}")
-        self.min_valid_input.setText(f"{cfg.min_valid_balls:d}")
 
     def append_log(self, text: str) -> None:
         self.log_widget.appendPlainText(text)
         self.log_widget.verticalScrollBar().setValue(self.log_widget.verticalScrollBar().maximum())
+
+
+class BallDetailWidget(QWidget):
+    """显示选中靶球的局部放大图"""
+    
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        
+        title = QLabel("Selected Ball Detail")
+        title.setStyleSheet("font-weight: bold; color: #aaa; font-size: 11px;")
+        
+        self.image_label = QLabel("点击表格中的靶球查看细节")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("border: 1px solid #444; background: #0a0a0a; color: #666;")
+        self.image_label.setScaledContents(False)
+        
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.info_label.setWordWrap(True)
+        
+        layout.addWidget(title)
+        layout.addWidget(self.image_label)
+        layout.addWidget(self.info_label)
+        
+        self._buffer: Optional[np.ndarray] = None
+        
+    def update_ball(self, image: np.ndarray, ball: BallMeasurement, upsample_factor: int = 1,
+                    min_diameter_um: float = 1.0, pixel_scale: float = 5.91) -> None:
+        """更新显示选中球的局部放大图"""
+        # 计算球在原图中的坐标（考虑上采样）
+        cx = int(ball.x_px / upsample_factor)
+        cy = int(ball.z_px / upsample_factor)
+        
+        # 计算5倍最小直径的像素大小
+        min_diam_px = min_diameter_um / pixel_scale
+        half_size = int(2.5 * min_diam_px)  # 5倍直径的一半
+        
+        # 提取区域
+        x0 = max(0, cx - half_size)
+        x1 = min(image.shape[1], cx + half_size)
+        y0 = max(0, cy - half_size)
+        y1 = min(image.shape[0], cy + half_size)
+        
+        if x1 <= x0 or y1 <= y0:
+            self.clear()
+            return
+            
+        # 直接提取原始图像patch
+        patch = image[y0:y1, x0:x1]
+        
+        # 归一化到uint8显示
+        if patch.dtype != np.uint8:
+            patch_f = patch.astype(np.float32)
+            patch_norm = (255 * (patch_f - patch_f.min()) / max((patch_f.max() - patch_f.min()), 1e-6))
+            patch_u8 = patch_norm.astype(np.uint8)
+        else:
+            patch_u8 = patch
+
+        # 简化：直接使用灰度格式，让 Qt 用 copy() 管理内存
+        if patch_u8.ndim == 3:
+            # 如果是多通道，转换为灰度
+            if patch_u8.shape[2] == 1:
+                patch_u8 = patch_u8[:, :, 0]
+            else:
+                # RGB to gray
+                patch_u8 = np.dot(patch_u8[...,:3], [0.299, 0.587, 0.114]).astype(np.uint8)
+        
+        # 确保连续内存
+        patch_c = np.ascontiguousarray(patch_u8)
+        h, w = patch_c.shape
+        
+        # 创建 QImage 并立即复制，让 Qt 管理内存
+        qimg = QImage(patch_c.data, w, h, w, QImage.Format_Grayscale8).copy()
+        pixmap = QPixmap.fromImage(qimg)
+        
+        # 设置pixmap（Qt会自动缩放）
+        self.image_label.setPixmap(pixmap)
+        self.image_label.setScaledContents(True)
+        
+        # 更新信息
+        info_lines = [f"Ball #{ball.index}"]
+        if ball.xfwhm_px:
+            info_lines.append(f"FWHM: {ball.xfwhm_px:.2f}px")
+        if ball.resolution_um:
+            info_lines.append(f"分辨率: {ball.resolution_um:.2f}µm")
+        if ball.sharpness:
+            info_lines.append(f"锐度: {ball.sharpness:.3f}")
+        info_lines.append(f"状态: {ball.quality_flag}")
+        
+        self.info_label.setText(" | ".join(info_lines))
+        
+    def clear(self) -> None:
+        """清除显示"""
+        self.image_label.clear()
+        self.image_label.setText("点击表格中的靶球查看细节")
+        self.info_label.setText("")
 
 
 class StatsPanel(QWidget):
@@ -791,15 +888,13 @@ class StatsPanel(QWidget):
         layout.setSpacing(8)
 
         self.lbl_valid = self._metric("有效小球", "--")
-        self.lbl_mean = self._metric("平均分辨率 (µm)", "--")
-        self.lbl_std = self._metric("标准差 (µm)", "--")
-        self.lbl_algo = QLabel("算法版本: --")
-        self.lbl_algo.setStyleSheet("color:#888;")
+        self.lbl_mean = self._metric("平均分辨率", "--")
+        self.lbl_std = self._metric("标准差", "--")
         self.warnings = QLabel("")
         self.warnings.setWordWrap(True)
-        self.warnings.setStyleSheet("color:#ffaa00;")
+        self.warnings.setStyleSheet("color:#ffaa00; font-size: 11px;")
 
-        for w in [self.lbl_valid, self.lbl_mean, self.lbl_std, self.lbl_algo, self.warnings]:
+        for w in [self.lbl_valid, self.lbl_mean, self.lbl_std, self.warnings]:
             layout.addWidget(w)
 
     def _metric(self, label: str, value: str) -> QWidget:
@@ -807,9 +902,9 @@ class StatsPanel(QWidget):
         h = QHBoxLayout(box)
         h.setContentsMargins(0, 0, 0, 0)
         lbl = QLabel(label)
-        lbl.setObjectName("MetricLabel")
+        lbl.setStyleSheet("color: #aaa; font-size: 11px;")
         val = QLabel(value)
-        val.setObjectName("MetricValue")
+        val.setStyleSheet("color: #fff; font-size: 11px;")
         h.addWidget(lbl)
         h.addStretch()
         h.addWidget(val)
@@ -817,33 +912,31 @@ class StatsPanel(QWidget):
         return box
 
     def update_from_result(self, result: AnalysisResult) -> None:
-        self.lbl_valid._value_label.setText(str(result.n_valid))  # type: ignore[attr-defined]
-        mean_text = f"{result.mean_resolution_um:.2f}" if result.mean_resolution_um else "--"
-        std_text = f"{result.std_resolution_um:.2f}" if result.std_resolution_um else "--"
+        # 有效球数显示，小于50时用红色高亮
+        valid_count = result.n_valid
+        if valid_count < 50:
+            self.lbl_valid._value_label.setText(f"{valid_count}")  # type: ignore[attr-defined]
+            self.lbl_valid._value_label.setStyleSheet("color: #ff4444; font-size: 11px; font-weight: bold;")  # type: ignore[attr-defined]
+        else:
+            self.lbl_valid._value_label.setText(str(valid_count))  # type: ignore[attr-defined]
+            self.lbl_valid._value_label.setStyleSheet("color: #fff; font-size: 11px;")  # type: ignore[attr-defined]
+        
+        mean_text = f"{result.mean_resolution_um:.2f} µm" if result.mean_resolution_um else "--"
+        std_text = f"{result.std_resolution_um:.2f} µm" if result.std_resolution_um else "--"
         self.lbl_mean._value_label.setText(mean_text)  # type: ignore[attr-defined]
         self.lbl_std._value_label.setText(std_text)  # type: ignore[attr-defined]
-        self.lbl_algo.setText(f"算法版本: {result.algorithm_version}")
         
-        # 显示筛选统计
-        warn_text = ""
-        if hasattr(result, "filter_stats") and result.filter_stats:
-            stats = result.filter_stats
-            stats_text = (
-                f"筛选统计:\n"
-                f"检测总数: {stats.get('total_detected', 0)}\n"
-                f"半径过滤: -{stats.get('radius_rejected', 0)}\n"
-                f"SNR过滤: -{stats.get('snr_rejected', 0)}\n"
-                f"边界剔除: -{stats.get('boundary_rejected', 0)}\n"
-                f"暗目标剔除: -{stats.get('dim_target_rejected', 0)}\n"
-                f"拟合失败: -{stats.get('fit_rejected', 0)}\n"
-                f"锐度过低: -{stats.get('profile_low_sharpness', 0)}"
-            )
-            warn_text += stats_text + "\n\n"
-            
+        # 构建警告文本
+        warning_lines = []
+        if valid_count < 50:
+            warning_lines.append(f"⚠ 有效靶球数不足50个（当前{valid_count}个），测试结果无效！")
         if result.warnings:
-            warn_text += "警告: " + "; ".join(result.warnings)
+            warning_lines.extend(result.warnings)
         
-        self.warnings.setText(warn_text)
+        if warning_lines:
+            self.warnings.setText("\n".join(warning_lines))
+        else:
+            self.warnings.setText("")
 
 
 class ResultTable(QTableWidget):
@@ -932,47 +1025,54 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Left panel: Controls
-        self.controls = ControlPanel(self.service.config)
-        self.controls.setMinimumWidth(200)
-        self.controls.setMaximumWidth(280)
+        # ===== Left panel: Controls + Stats + Histogram =====
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
         
-        # Center panel: Image with ROI selection
+        # Controls at top
+        self.controls = ControlPanel(self.service.config)
+        left_layout.addWidget(self.controls)
+        
+        # Stats panel (靶球统计信息)
+        self.stats = StatsPanel()
+        left_layout.addWidget(self.stats)
+        
+        # FWHM Histogram at bottom of left panel
+        self.histogram_widget = FWHMResidualHistWidget()
+        left_layout.addWidget(self.histogram_widget)
+        
+        # ===== Center panel: Image with ROI selection =====
         self.center_panel = CenterPanel(pixel_scale_um=self.service.config.physical.pixel_scale_um_per_px)
         self.center_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # Right panel: Profile curve + Stats + Table
+        # ===== Right panel: Ball Detail + Profile + Table =====
         right_panel = QWidget()
-        right_panel.setMinimumWidth(320)
-        right_panel.setMaximumWidth(400)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(10)
 
-        # FWHM Residual Histogram at top
-        self.histogram_widget = FWHMResidualHistWidget()
-        right_layout.addWidget(self.histogram_widget)
+        # Ball detail widget at top (局部放大图)
+        self.ball_detail = BallDetailWidget()
+        right_layout.addWidget(self.ball_detail)
         
-        # Profile curve below histogram
+        # Profile curve in middle
         self.profile_widget = ProfileCurveWidget()
         right_layout.addWidget(self.profile_widget)
-        
-        # Stats panel
-        self.stats = StatsPanel()
-        right_layout.addWidget(self.stats)
         
         # Separator
         line = QFrame()
         line.setObjectName("line")
         right_layout.addWidget(line)
         
-        # Result table
+        # Result table at bottom
         self.table = ResultTable()
         right_layout.addWidget(self.table, 1)  # Stretch factor 1
 
         # Three-column layout
         main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.addWidget(self.controls)
+        main_splitter.addWidget(left_panel)
         main_splitter.addWidget(self.center_panel)
         main_splitter.addWidget(right_panel)
         main_splitter.setHandleWidth(6)
@@ -1042,7 +1142,6 @@ class MainWindow(QMainWindow):
             min_diameter_um = self.controls._read_float(self.controls.min_diam_input, positive=True)
             max_diameter_um = self.controls._read_float(self.controls.max_diam_input, positive=True)
             background_threshold = self.controls._read_float(self.controls.bg_thresh_input, positive=True)
-            min_valid_balls = int(self.controls._read_float(self.controls.min_valid_input, positive=True))
         except (ValueError, AttributeError):
             QMessageBox.warning(self, "参数错误", "请检查参数值，必须为正数。")
             return
@@ -1061,7 +1160,6 @@ class MainWindow(QMainWindow):
         cfg.detection.min_diameter_um = min_diameter_um
         cfg.detection.max_diameter_um = max_diameter_um
         cfg.detection.background_threshold = background_threshold
-        cfg.min_valid_balls = min_valid_balls
         
         # Update center panel pixel scale for ROI display
         self.center_panel.set_pixel_scale(pixel_scale)
@@ -1081,6 +1179,16 @@ class MainWindow(QMainWindow):
         self.table.update_rows(result.valid_balls, result.invalid_balls)
         self.center_panel.overlay_results(result)
         
+        # 弹窗警告：有效靶球数不足
+        if result.n_valid < 50:
+            QMessageBox.warning(
+                self, 
+                "计量无效", 
+                f"根据 OCT 分辨率计量操作规程：\n\n"
+                f"有效靶球数必须不少于 50 个（当前检测到 {result.n_valid} 个）。\n\n"
+                "本次计量测试结果无效，建议重新选取 ROI 或检查图像质量。"
+            )
+        
         # Update histogram with all valid balls
         if result.valid_balls:
             self.histogram_widget.update_histogram(result.valid_balls)
@@ -1094,16 +1202,26 @@ class MainWindow(QMainWindow):
         """Handle ball selection from table."""
         if ball_index >= 0:
             self.center_panel.set_selected_ball(ball_index)
-            # Update profile curve with selected ball
-            if self.current_result:
+            # Update profile curve and detail view with selected ball
+            if self.current_result and self.current_image is not None:
                 # Find the ball with matching index
                 for ball in self.current_result.valid_balls + self.current_result.invalid_balls:
                     if ball.index == ball_index:
                         self.profile_widget.update_profile(ball)
+                        # Update ball detail with local magnified view
+                        self.ball_detail.update_ball(
+                            self.current_image, 
+                            ball, 
+                            self.current_result.upsample_factor,
+                            min_diameter_um=self.service.config.detection.min_diameter_um,
+                            pixel_scale=self.service.config.physical.pixel_scale_um_per_px
+                        )
                         break
         else:
+            # Deselected
             self.center_panel.set_selected_ball(None)
-            # Clear profile when deselected
+            self.profile_widget.clear()
+            self.ball_detail.clear()
             if self.current_result and self.current_result.valid_balls:
                 # Show first valid ball when nothing selected
                 self.profile_widget.update_profile(self.current_result.valid_balls[0])
@@ -1117,6 +1235,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.profile_widget.clear()
         self.histogram_widget.clear()
+        self.ball_detail.clear()
         self._log("已清除所有结果")
 
     def _on_error(self, msg: str) -> None:
